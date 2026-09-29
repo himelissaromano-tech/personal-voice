@@ -39,6 +39,7 @@ struct VoiceInkApp: App {
     @StateObject private var prewarmService: ModelPrewarmService
 
     init() {
+        // Track every app launch, including sessions where logs are never exported.
         _ = LogExporter.shared
 
         // Disable HTTP response caching — prevents API responses from being stored in Cache.db
