@@ -85,7 +85,13 @@ class CursorPaster {
 
         let application = NSWorkspace.shared.frontmostApplication
         let appIdentifier = application?.bundleIdentifier ?? "unknown"
+        let focusDiagnostics = PasteFocusDiagnostics(sessionID: sessionID)
+        focusDiagnostics.captureAroundPaste(processID: application?.processIdentifier, appIdentifier: appIdentifier)
         let pasteResult = await postPasteCommand(sessionID: sessionID)
+        focusDiagnostics.captureAfterPaste(
+            commandPosted: pasteResult.didPostPasteCommand,
+            commandProcessID: application?.processIdentifier
+        )
         logger.notice(
             "Paste id=\(sessionID, privacy: .public) app=\(appIdentifier, privacy: .public) commandPosted=\(pasteResult.didPostPasteCommand, privacy: .public) queueMs=\(queueWaitMs, privacy: .public) elapsedMs=\(elapsedMilliseconds(since: startedAt), privacy: .public)"
         )
