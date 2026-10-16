@@ -1,0 +1,247 @@
+{
+  "format": "voiceink.dictionary",
+  "schemaVersion": 1,
+  "exportedAt": "2026-10-15T00:00:00Z",
+  "appVersion": "2.21",
+  "vocabulary": [
+    {
+      "term": "Claude Code"
+    },
+    {
+      "term": "Claude"
+    },
+    {
+      "term": "Anthropic"
+    },
+    {
+      "term": "ChatGPT"
+    },
+    {
+      "term": "OpenAI"
+    },
+    {
+      "term": "Ollama"
+    },
+    {
+      "term": "VoiceInk"
+    },
+    {
+      "term": "Parakeet"
+    },
+    {
+      "term": "Whisper"
+    },
+    {
+      "term": "GitHub"
+    },
+    {
+      "term": "GitHub Actions"
+    },
+    {
+      "term": "pull request"
+    },
+    {
+      "term": "Git"
+    },
+    {
+      "term": "README"
+    },
+    {
+      "term": "CLI"
+    },
+    {
+      "term": "API"
+    },
+    {
+      "term": "SDK"
+    },
+    {
+      "term": "MCP"
+    },
+    {
+      "term": "JSON"
+    },
+    {
+      "term": "YAML"
+    },
+    {
+      "term": "Xcode"
+    },
+    {
+      "term": "Swift"
+    },
+    {
+      "term": "SwiftUI"
+    },
+    {
+      "term": "SwiftData"
+    },
+    {
+      "term": "macOS"
+    },
+    {
+      "term": "iOS"
+    },
+    {
+      "term": "Homebrew"
+    },
+    {
+      "term": "localhost"
+    },
+    {
+      "term": "SSH"
+    },
+    {
+      "term": "TypeScript"
+    },
+    {
+      "term": "JavaScript"
+    },
+    {
+      "term": "Node.js"
+    },
+    {
+      "term": "npm"
+    },
+    {
+      "term": "pnpm"
+    },
+    {
+      "term": "Python"
+    },
+    {
+      "term": "pytest"
+    },
+    {
+      "term": "Docker"
+    },
+    {
+      "term": "PostgreSQL"
+    },
+    {
+      "term": "Gmail"
+    },
+    {
+      "term": "Google Drive"
+    },
+    {
+      "term": "Notion"
+    },
+    {
+      "term": "Shopify"
+    },
+    {
+      "term": "Zoho Books"
+    }
+  ],
+  "replacements": [
+    {
+      "sources": [
+        "git hub"
+      ],
+      "replacement": "GitHub"
+    },
+    {
+      "sources": [
+        "get hub"
+      ],
+      "replacement": "GitHub"
+    },
+    {
+      "sources": [
+        "chat gpt"
+      ],
+      "replacement": "ChatGPT"
+    },
+    {
+      "sources": [
+        "claud code"
+      ],
+      "replacement": "Claude Code"
+    },
+    {
+      "sources": [
+        "clawed code"
+      ],
+      "replacement": "Claude Code"
+    },
+    {
+      "sources": [
+        "cloud code"
+      ],
+      "replacement": "Claude Code"
+    },
+    {
+      "sources": [
+        "open ai"
+      ],
+      "replacement": "OpenAI"
+    },
+    {
+      "sources": [
+        "o llama"
+      ],
+      "replacement": "Ollama"
+    },
+    {
+      "sources": [
+        "x code"
+      ],
+      "replacement": "Xcode"
+    },
+    {
+      "sources": [
+        "swift ui"
+      ],
+      "replacement": "SwiftUI"
+    },
+    {
+      "sources": [
+        "swift data"
+      ],
+      "replacement": "SwiftData"
+    },
+    {
+      "sources": [
+        "mac os"
+      ],
+      "replacement": "macOS"
+    },
+    {
+      "sources": [
+        "type script"
+      ],
+      "replacement": "TypeScript"
+    },
+    {
+      "sources": [
+        "java script"
+      ],
+      "replacement": "JavaScript"
+    },
+    {
+      "sources": [
+        "node js"
+      ],
+      "replacement": "Node.js"
+    },
+    {
+      "sources": [
+        "post gres"
+      ],
+      "replacement": "Postgres"
+    },
+    {
+      "sources": [
+        "voice ink"
+      ],
+      "replacement": "VoiceInk"
+    },
+    {
+      "sources": [
+        "dot env"
+      ],
+      "replacement": ".env"
+    }
+  ]
+}

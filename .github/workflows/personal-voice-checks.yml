@@ -1,0 +1,20 @@
+# Added by personal-voice (2026-10-15).
+# Runs the meaning-preservation regression tests. No secrets, no paid services.
+name: personal-voice checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import files match generate_config.py
+        run: python3 PersonalVoice/generate_config.py --check
+      - name: Regression tests
+        run: swift test

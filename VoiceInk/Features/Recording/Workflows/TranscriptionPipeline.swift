@@ -1,3 +1,4 @@
+// Modified by personal-voice (2026-10-15): AI output that fails MeaningGuard is replaced by the verbatim transcript.
 import Foundation
 import SwiftData
 import os
@@ -204,6 +205,26 @@ class TranscriptionPipeline {
                         transcription.aiRequestSystemMessage = enhancementResult.systemMessage
                         transcription.aiRequestUserMessage = enhancementResult.userMessage
                         finalText = enhancementResult.text
+
+                        // personal-voice: never paste polished text that dropped a protected
+                        // technical token or a negation; fall back to the unpolished transcript.
+                        if !shouldRespondInRecorder {
+                            let guardResult = MeaningGuard.check(original: textForAI, polished: enhancementResult.text)
+                            if !guardResult.isPreserved {
+                                logger.notice(
+                                    "Meaning guard rejected AI output: \(guardResult.violations.map(\.description).joined(separator: "; "), privacy: .private)"
+                                )
+                                finalText = textForAI
+                                await MainActor.run {
+                                    NotificationManager.shared.showNotification(
+                                        title: String(
+                                            localized: "Polished text changed a technical detail. Pasted the verbatim transcript instead."
+                                        ),
+                                        type: .warning
+                                    )
+                                }
+                            }
+                        }
                     } catch {
                         let errorDescription = EnhancementFailureFormatter.description(for: error)
                         let failureMessage = EnhancementFailureFormatter.message(description: errorDescription)

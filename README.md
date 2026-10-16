@@ -1,3 +1,7 @@
+> **personal-voice** is a personal fork of [VoiceInk](https://github.com/Beingpax/VoiceInk) by Pax, licensed under GPL-3.0.
+> It adds Verbatim and Polished Prompt dictation modes, app profiles for ChatGPT, Claude Code, Gmail and Messages, a technical dictionary, and meaning-preservation tests, all fully local.
+> Setup and testing: [PERSONAL_VOICE.md](PERSONAL_VOICE.md). Changes from upstream: [NOTICE.md](NOTICE.md). Everything below is the upstream README.
+
 <div align="center">
   <img src="VoiceInk/Assets.xcassets/AppIcon.appiconset/256-mac.png" width="180" height="180" />
   <h1>VoiceInk</h1>
