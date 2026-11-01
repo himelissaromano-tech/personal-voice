@@ -100,6 +100,17 @@ struct PersonalVoiceNoAutoSubmitTests {
     }
 
     @Test
+    func everyImportedModeKeepsPerModeAutoSendOff() throws {
+        for mode in try PersonalVoiceFiles.modes() {
+            let name = mode["name"] as? String ?? "?"
+            #expect(
+                mode["autoSendKey"] == nil || mode["autoSendKey"] as? String == "none",
+                "\(name) must not submit text automatically"
+            )
+        }
+    }
+
+    @Test
     func promptsTellTheModelTheUserSendsManually() throws {
         for prompt in try PersonalVoiceFiles.prompts() {
             let text = try #require(prompt["promptText"] as? String)
