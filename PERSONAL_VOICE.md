@@ -32,7 +32,7 @@ technical detail."* The polished version stays in History if you want it.
 | Local AI polish, free | Yes (Ollama; VoiceInk Refine needs 16 GB RAM and ignores custom prompts) | Ollama + 3 custom prompts |
 | App-specific profiles | Yes (Modes with app/URL triggers) | 6 modes, configuration only |
 | Technical dictionary | Yes (vocabulary + replacements) | 43 terms, 18 checked replacements |
-| No auto-submit | Yes ("Finish and send" key, off by default) | Kept off; every mode set to paste only |
+| No auto-submit | Yes (global and per-mode send keys, off by default) | Both stay off in the shipped import; every mode is paste-only |
 | Import config | Yes (Settings > Import Settings) | `PersonalVoice/PersonalVoice-Settings.json` |
 | Keep dictated code | **No**: `()`/`[]`/`{}` content was deleted | Fixed in `TranscriptionOutputFilter` |
 | Guard against meaning drift | **No** | `MeaningGuard` + pipeline fallback |
