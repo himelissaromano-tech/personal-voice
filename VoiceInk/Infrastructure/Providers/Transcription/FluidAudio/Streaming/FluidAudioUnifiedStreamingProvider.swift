@@ -32,7 +32,12 @@ final class FluidAudioUnifiedStreamingProvider: StreamingTranscriptionProvider {
     }
 
     func connect(model: any TranscriptionModel, language: String?) async throws {
-        let manager = try await models.acquire()
+        let manager = try await TranscriptionDiagnostics.measure(
+            "unified-streaming-model-load", logger: logger,
+            details: "model=\(model.name) encoderPrecision=\(FluidAudioModelManager.parakeetUnifiedPrecision) configuration=SDK-default"
+        ) {
+            try await models.acquire()
+        }
         do {
             let continuation = eventsContinuation
             await manager.setPartialTranscriptCallback { continuation?.yield(.partial(text: $0)) }
@@ -53,15 +58,21 @@ final class FluidAudioUnifiedStreamingProvider: StreamingTranscriptionProvider {
         guard let buffer = PCMAudioConverter.pcmBuffer(fromPCM16Data: data) else {
             throw StreamingTranscriptionError.audioConversionFailed
         }
-        _ = try await process { manager in
-            try await manager.appendAudio(buffer)
-            try await manager.processBufferedAudio()
-            return ""
+        try await TranscriptionDiagnostics.measure(
+            "unified-streaming-processing", logger: logger, details: "bytes=\(data.count)"
+        ) {
+            _ = try await process { manager in
+                try await manager.appendAudio(buffer)
+                try await manager.processBufferedAudio()
+                return ""
+            }
         }
     }
 
     func commit() async throws {
-        let finalText = try await process { manager in try await manager.finish() }
+        let finalText = try await TranscriptionDiagnostics.measure("unified-streaming-finish", logger: logger) {
+            try await process { manager in try await manager.finish() }
+        }
         let text = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
         eventsContinuation?.yield(.committed(text: text))
     }
@@ -70,10 +81,12 @@ final class FluidAudioUnifiedStreamingProvider: StreamingTranscriptionProvider {
         isDisconnected = true
         if let manager {
             self.manager = nil
-            await processing.lock()
-            await manager.setPartialTranscriptCallback { _ in }
-            await models.release(manager)
-            processing.unlock()
+            _ = try? await TranscriptionDiagnostics.measure("unified-streaming-cleanup", logger: logger) {
+                await processing.lock()
+                await manager.setPartialTranscriptCallback { _ in }
+                await models.release(manager)
+                processing.unlock()
+            }
         }
         eventsContinuation?.finish()
         logger.notice("Parakeet Unified streaming disconnected")
