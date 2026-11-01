@@ -157,6 +157,9 @@ permissions again after each rebuild.
 
 - In the app: **Dictionary**. Add terms under Vocabulary and fixes under Replacements.
   Changes apply right away.
+- The shipped import keeps **Auto Learn off**. If you later enable it, turn **AI Review off**
+  to review corrections locally with Apple's on-device spelling and name recognition.
+  Clear spelling corrections can become replacements; uncertain names still require your approval.
 - As a file: edit `VOCABULARY` / `REPLACEMENTS` in `PersonalVoice/generate_config.py`,
   then run these two commands. The tests reject unsafe replacements, for example
   ones that touch digits or negations, or that rewrite ordinary English.
