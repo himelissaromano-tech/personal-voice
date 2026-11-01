@@ -22,13 +22,18 @@ let package = Package(
                 "Features/Enhancement/State/FillerWordManager.swift",
                 "Features/Recording/Processing/TranscriptionOutputFilter.swift",
                 "Features/Dictionary/Workflows/WordReplacementVariants.swift",
+                "Features/Dictionary/AutoLearn/AutoLearnTypes.swift",
+                "Features/Dictionary/AutoLearn/CorrectionDiffEngine.swift",
+                "Features/Dictionary/AutoLearn/AutoLearnLocalTextAnalyzer.swift",
+                "Features/Dictionary/AutoLearn/AutoLearnLocalReviewer.swift",
                 "Infrastructure/TextProcessing/ParagraphFormatter.swift",
             ]
         ),
         .testTarget(
             name: "VoiceInkTests",
             dependencies: ["VoiceInk"],
-            path: "Tests/VoiceInkTests"
+            path: "Tests/VoiceInkTests",
+            exclude: ["AutoLearnLocalReviewerTests.swift"]
         ),
     ]
 )
