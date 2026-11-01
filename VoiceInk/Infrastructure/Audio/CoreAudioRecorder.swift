@@ -40,6 +40,8 @@ final class CoreAudioRecorder: @unchecked Sendable {
     private var deviceFormat = AudioStreamBasicDescription()
     private var captureChannelCount: UInt32 = 1
     private var captureChannelSelection = AudioInputChannelSelection(deviceChannelIndices: [])
+    private var diagnosticPreferredInputChannels: [UInt32]?
+    private var diagnosticMappedInputChannels: [Int32] = []
     // Output format (16kHz mono PCM Int16 for transcription)
     private var outputFormat = AudioStreamBasicDescription()
 
@@ -79,6 +81,79 @@ final class CoreAudioRecorder: @unchecked Sendable {
     private let droppedInputBuffersBackpressure = ManagedAtomic<UInt64>(0)
     private let droppedInputBuffersCapacity = ManagedAtomic<UInt64>(0)
 
+    // Per-recording diagnostics. The render callback only touches atomics so it
+    // remains realtime-safe; a consolidated summary is emitted after capture stops.
+    private var recordingAttemptID: String?
+    private let captureStartedAtNanoseconds = ManagedAtomic<UInt64>(0)
+    private let audioUnitStartCalledAtNanoseconds = ManagedAtomic<UInt64>(0)
+    private let audioUnitStartReturnedAtNanoseconds = ManagedAtomic<UInt64>(0)
+    private let audioUnitStartStatus = ManagedAtomic<Int32>(0)
+    private let firstInputCallbackAtNanoseconds = ManagedAtomic<UInt64>(0)
+    private let firstSuccessfulRenderAtNanoseconds = ManagedAtomic<UInt64>(0)
+    private let firstNonZeroSignalAtNanoseconds = ManagedAtomic<UInt64>(0)
+    private let firstSignalAbove90DbAtNanoseconds = ManagedAtomic<UInt64>(0)
+    private let firstSignalAbove60DbAtNanoseconds = ManagedAtomic<UInt64>(0)
+    private let firstSignalAbove40DbAtNanoseconds = ManagedAtomic<UInt64>(0)
+    private let firstNonZeroSignalFrameOffset = ManagedAtomic<UInt64>(0)
+    private let firstSignalAbove90DbFrameOffset = ManagedAtomic<UInt64>(0)
+    private let firstSignalAbove60DbFrameOffset = ManagedAtomic<UInt64>(0)
+    private let firstSignalAbove40DbFrameOffset = ManagedAtomic<UInt64>(0)
+    private let maximumAbsoluteSampleBits = ManagedAtomic<UInt32>(Float32(0).bitPattern)
+    private let exactlySilentRenderCount = ManagedAtomic<UInt64>(0)
+    private let below90DbRenderCount = ManagedAtomic<UInt64>(0)
+    private let firstFileWriteAtNanoseconds = ManagedAtomic<UInt64>(0)
+    private let firstAudioChunkAtNanoseconds = ManagedAtomic<UInt64>(0)
+    private let audioChunkCount = ManagedAtomic<UInt64>(0)
+    private let inputCallbackCount = ManagedAtomic<UInt64>(0)
+    private let inputCallbackFrameCount = ManagedAtomic<UInt64>(0)
+    private let successfulRenderCount = ManagedAtomic<UInt64>(0)
+    private let successfulRenderFrameCount = ManagedAtomic<UInt64>(0)
+    private let renderFailureCount = ManagedAtomic<UInt64>(0)
+    private let firstRenderFailureStatus = ManagedAtomic<Int32>(0)
+    private let missingRenderBufferCount = ManagedAtomic<UInt64>(0)
+    private let oversizedRenderRequestCount = ManagedAtomic<UInt64>(0)
+    private let unavailableEnqueueBufferCount = ManagedAtomic<UInt64>(0)
+    private let oversizedEnqueueRequestCount = ManagedAtomic<UInt64>(0)
+    private let enqueuedFrameCount = ManagedAtomic<UInt64>(0)
+    private let missingAudioFileBufferCount = ManagedAtomic<UInt64>(0)
+    private let rejectedConversionBufferCount = ManagedAtomic<UInt64>(0)
+    private let writtenFrameCount = ManagedAtomic<UInt64>(0)
+    private let fileWriteFailureCount = ManagedAtomic<UInt64>(0)
+    private let firstFileWriteFailureStatus = ManagedAtomic<Int32>(0)
+    private let deviceAliveChangeCount = ManagedAtomic<UInt64>(0)
+    private let deviceSampleRateChangeCount = ManagedAtomic<UInt64>(0)
+    private let deviceStreamConfigurationChangeCount = ManagedAtomic<UInt64>(0)
+    private let deviceBufferSizeChangeCount = ManagedAtomic<UInt64>(0)
+    private let deviceRunningChangeCount = ManagedAtomic<UInt64>(0)
+    private var observedDevicePropertyAddresses: [AudioObjectPropertyAddress] = []
+    private var observedDeviceID: AudioDeviceID = 0
+
+    private let devicePropertyListener: AudioObjectPropertyListenerProc = {
+        _, addressCount, addresses, clientData in
+        guard let clientData else { return noErr }
+        let recorder = Unmanaged<CoreAudioRecorder>.fromOpaque(clientData).takeUnretainedValue()
+
+        for index in 0..<Int(addressCount) {
+            switch addresses[index].mSelector {
+            case kAudioDevicePropertyDeviceIsAlive:
+                recorder.deviceAliveChangeCount.wrappingIncrement(ordering: .relaxed)
+            case kAudioDevicePropertyNominalSampleRate:
+                recorder.deviceSampleRateChangeCount.wrappingIncrement(ordering: .relaxed)
+            case kAudioDevicePropertyStreamConfiguration:
+                recorder.deviceStreamConfigurationChangeCount.wrappingIncrement(ordering: .relaxed)
+            case kAudioDevicePropertyBufferFrameSize:
+                recorder.deviceBufferSizeChangeCount.wrappingIncrement(ordering: .relaxed)
+            case kAudioDevicePropertyDeviceIsRunning:
+                recorder.deviceRunningChangeCount.wrappingIncrement(ordering: .relaxed)
+            default:
+                break
+            }
+            recorder.logObservedDevicePropertyChange(selector: addresses[index].mSelector)
+        }
+
+        return noErr
+    }
+
     /// Called from the recorder processing queue with raw PCM data (16-bit, 16kHz, mono) for streaming.
     private let audioChunkLock = NSLock()
     private var _onAudioChunk: ((_ data: Data) -> Void)?
@@ -109,13 +184,19 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
     /// Prepares AUHAL for the selected device without starting capture.
     func prepare(deviceID: AudioDeviceID, selectedInputChannels: [UInt32]? = nil) throws {
+        RecordingDiagnostics.shared.mark(
+            "core-audio-prepare-entered",
+            details: "deviceID=\(deviceID) isRecording=\(isRecording) alreadyPrepared=\(isPrepared(for: deviceID, selectedInputChannels: selectedInputChannels)) currentDeviceID=\(currentDeviceID)"
+        )
         if isRecording {
+            RecordingDiagnostics.shared.mark("core-audio-prepare-skipped", details: "reason=already-recording")
             return
         }
 
         try validateDevice(deviceID)
 
         if isPrepared(for: deviceID, selectedInputChannels: selectedInputChannels) {
+            RecordingDiagnostics.shared.mark("core-audio-prepare-reused", details: "deviceID=\(deviceID)")
             return
         }
 
@@ -129,15 +210,24 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
         do {
             try createAudioUnit()
+            RecordingDiagnostics.shared.mark("core-audio-unit-created")
 
             try setInputDevice(deviceID)
+            RecordingDiagnostics.shared.mark("core-audio-device-bound", details: "deviceID=\(deviceID)")
 
             try configureFormats(selectedInputChannels: selectedInputChannels)
+            RecordingDiagnostics.shared.mark("core-audio-formats-configured")
 
             try setupInputCallback()
+            RecordingDiagnostics.shared.mark("core-audio-input-callback-configured")
 
             try initializeAudioUnit()
+            RecordingDiagnostics.shared.mark("core-audio-unit-initialized")
         } catch {
+            RecordingDiagnostics.shared.mark(
+                "core-audio-prepare-failed",
+                details: "deviceID=\(deviceID) error=\(String(describing: error))"
+            )
             teardownPreparedAudioUnit()
             throw error
         }
@@ -145,35 +235,80 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
     /// Discards an idle prepared AUHAL so the next recording creates a fresh connection.
     /// Active recordings keep their existing device-switching lifecycle.
-    func invalidatePreparation() {
-        guard !isRecording, audioUnit != nil else { return }
+    func invalidatePreparation(reason: String = "unspecified") {
+        RecordingDiagnostics.shared.mark(
+            "core-audio-preparation-invalidation-requested",
+            details: "reason=\(reason) isRecording=\(isRecording) hasAudioUnit=\(audioUnit != nil)"
+        )
+
+        guard !isRecording else {
+            RecordingDiagnostics.shared.mark(
+                "core-audio-preparation-invalidation-skipped",
+                details: "reason=\(reason) state=recording"
+            )
+            return
+        }
+
+        guard audioUnit != nil else { return }
 
         teardownPreparedAudioUnit()
         currentDeviceID = 0
         resetMeters()
+        RecordingDiagnostics.shared.mark(
+            "core-audio-preparation-invalidated",
+            details: "reason=\(reason)"
+        )
     }
 
     /// Starts recording from the specified device to the given URL (WAV format)
     func startRecording(
         toOutputFile url: URL, deviceID: AudioDeviceID, selectedInputChannels: [UInt32]? = nil
     ) throws {
-        // Stop any existing recording
+        // Finish any prior attempt before beginning a new correlated trace.
         stopRecording()
+        RecordingDiagnostics.shared.beginIfNeeded(
+            trigger: "core-audio",
+            details: "deviceID=\(deviceID)"
+        )
+        RecordingDiagnostics.shared.mark(
+            "core-audio-start-entered",
+            details: "deviceID=\(deviceID) file=\(url.lastPathComponent)"
+        )
 
-        try prepare(deviceID: deviceID, selectedInputChannels: selectedInputChannels)
+        let reusedPreparedAudioUnit = isPrepared(for: deviceID, selectedInputChannels: selectedInputChannels)
+        RecordingDiagnostics.shared.mark(
+            "core-audio-prepared-state-checked",
+            details: "reusedPreparedUnit=\(reusedPreparedAudioUnit)"
+        )
+        do {
+            try prepare(deviceID: deviceID, selectedInputChannels: selectedInputChannels)
+        } catch {
+            RecordingDiagnostics.shared.mark(
+                "core-audio-start-failed",
+                details: "phase=prepare error=\(String(describing: error))"
+            )
+            RecordingDiagnostics.shared.end(outcome: "start-failure", details: "phase=prepare")
+            throw error
+        }
 
         do {
             recordingURL = url
+            beginCaptureDiagnostics()
 
             // The output file is per recording; the AUHAL setup above is reused.
+            RecordingDiagnostics.shared.mark("core-audio-output-file-create-began")
             try createOutputFile(at: url)
+            RecordingDiagnostics.shared.mark("core-audio-output-file-created")
             resetAudioProcessingState()
 
+            RecordingDiagnostics.shared.mark("core-audio-unit-start-call-began")
             try startAudioUnit()
+            logCaptureStart(reusedPreparedAudioUnit: reusedPreparedAudioUnit)
         } catch {
             isRecording = false
             recordingActive.store(false, ordering: .releasing)
             closeOutputFile()
+            logCaptureSummary(context: "start-failure", fileURL: url)
             recordingURL = nil
             teardownPreparedAudioUnit()
             throw error
@@ -186,6 +321,7 @@ final class CoreAudioRecorder: @unchecked Sendable {
             return
         }
 
+        let stoppedRecordingURL = recordingURL
         let wasRecording = isRecording
         isRecording = false
         recordingActive.store(false, ordering: .releasing)
@@ -209,6 +345,7 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
         let shouldInvalidatePreparation = capturedTooLittleAudio()
         closeOutputFile()
+        logCaptureSummary(context: "stop", fileURL: stoppedRecordingURL)
         recordingURL = nil
 
         // Rebuild the input next time if too little audio was captured.
@@ -279,6 +416,7 @@ final class CoreAudioRecorder: @unchecked Sendable {
             logger.warning("🎙️ Warning: AudioUnitUninitialize returned \(status, privacy: .public)")
         }
         isAudioUnitInitialized = false
+        stopObservingDeviceProperties()
 
         // Step 3: Set the new device
         var device = newDeviceID
@@ -301,6 +439,7 @@ final class CoreAudioRecorder: @unchecked Sendable {
             let initializeStatus = AudioUnitInitialize(unit)
             isAudioUnitInitialized = initializeStatus == noErr
             if initializeStatus == noErr {
+                startObservingDeviceProperties(deviceID: oldDeviceID)
                 let startStatus = AudioOutputUnitStart(unit)
                 if startStatus == noErr {
                     recordingActive.store(true, ordering: .releasing)
@@ -344,6 +483,7 @@ final class CoreAudioRecorder: @unchecked Sendable {
         deviceFormat = newDeviceFormat
         captureChannelCount = newCaptureChannelCount
         currentDeviceID = newDeviceID
+        startObservingDeviceProperties(deviceID: newDeviceID)
 
         // Step 7: Reinitialize and restart
         status = AudioUnitInitialize(unit)
@@ -438,6 +578,8 @@ final class CoreAudioRecorder: @unchecked Sendable {
             logger.error("Failed to set input device \(deviceID, privacy: .public): \(status, privacy: .public)")
             throw CoreAudioRecorderError.failedToSetDevice(status: status)
         }
+
+        startObservingDeviceProperties(deviceID: deviceID)
     }
 
     private func configureFormats(selectedInputChannels: [UInt32]?) throws {
@@ -517,9 +659,10 @@ final class CoreAudioRecorder: @unchecked Sendable {
             throw CoreAudioRecorderError.audioUnitNotInitialized
         }
 
+        let preferredInputChannels = getPreferredInputChannels(deviceID: deviceID)
         let selection = AudioInputChannelSelection.resolve(
             deviceChannelCount: deviceFormat.mChannelsPerFrame,
-            preferredStereoChannels: getPreferredInputChannels(deviceID: deviceID),
+            preferredStereoChannels: preferredInputChannels,
             selectedChannels: selectedInputChannels
         )
         let channelCount = UInt32(selection.deviceChannelIndices.count)
@@ -570,6 +713,8 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
         captureChannelSelection = selection
         let mappedChannels = selection.deviceChannelIndices.map { $0 + 1 }
+        diagnosticPreferredInputChannels = preferredInputChannels
+        diagnosticMappedInputChannels = selection.deviceChannelIndices
         logger.notice("🎙️ Capturing device input channels: \(mappedChannels, privacy: .public)")
         return channelCount
     }
@@ -693,7 +838,10 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
         isRecording = true
         recordingActive.store(true, ordering: .releasing)
+        audioUnitStartCalledAtNanoseconds.store(DispatchTime.now().uptimeNanoseconds, ordering: .relaxed)
         let status = AudioOutputUnitStart(audioUnit)
+        audioUnitStartReturnedAtNanoseconds.store(DispatchTime.now().uptimeNanoseconds, ordering: .relaxed)
+        audioUnitStartStatus.store(status, ordering: .relaxed)
         if status != noErr {
             isRecording = false
             recordingActive.store(false, ordering: .releasing)
@@ -757,6 +905,7 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
     private func teardownPreparedAudioUnit() {
         recordingActive.store(false, ordering: .releasing)
+        stopObservingDeviceProperties()
         if let unit = audioUnit {
             AudioOutputUnitStop(unit)
             waitForRenderCallbacksToFinish()
@@ -836,14 +985,27 @@ final class CoreAudioRecorder: @unchecked Sendable {
             return noErr
         }
 
+        inputCallbackCount.wrappingIncrement(ordering: .relaxed)
+        inputCallbackFrameCount.wrappingIncrement(by: UInt64(inNumberFrames), ordering: .relaxed)
+        _ = firstInputCallbackAtNanoseconds.compareExchange(
+            expected: 0,
+            desired: DispatchTime.now().uptimeNanoseconds,
+            ordering: .relaxed
+        )
+
         let channelCount = captureChannelCount
         let inputSampleRate = deviceFormat.mSampleRate
         let requiredSamples = inNumberFrames * channelCount
 
-        guard let renderBuf = renderBuffer,
-            requiredSamples <= renderBufferSize,
+        guard let renderBuf = renderBuffer else {
+            missingRenderBufferCount.wrappingIncrement(ordering: .relaxed)
+            droppedInputBuffersCapacity.wrappingIncrement(ordering: .relaxed)
+            return noErr
+        }
+        guard requiredSamples <= renderBufferSize,
             requiredSamples <= inputBufferCapacitySamples
         else {
+            oversizedRenderRequestCount.wrappingIncrement(ordering: .relaxed)
             droppedInputBuffersCapacity.wrappingIncrement(ordering: .relaxed)
             return noErr
         }
@@ -871,8 +1033,22 @@ final class CoreAudioRecorder: @unchecked Sendable {
         )
 
         if status != noErr {
+            renderFailureCount.wrappingIncrement(ordering: .relaxed)
+            _ = firstRenderFailureStatus.compareExchange(
+                expected: 0,
+                desired: status,
+                ordering: .relaxed
+            )
             return status
         }
+
+        successfulRenderCount.wrappingIncrement(ordering: .relaxed)
+        successfulRenderFrameCount.wrappingIncrement(by: UInt64(inNumberFrames), ordering: .relaxed)
+        _ = firstSuccessfulRenderAtNanoseconds.compareExchange(
+            expected: 0,
+            desired: DispatchTime.now().uptimeNanoseconds,
+            ordering: .relaxed
+        )
 
         // Calculate audio meters from input buffer
         calculateMeters(from: &bufferList, frameCount: inNumberFrames)
@@ -913,6 +1089,68 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
         averagePowerBits.store(avgDb.bitPattern, ordering: .relaxed)
         peakPowerBits.store(peakDb.bitPattern, ordering: .relaxed)
+        recordSignalDiagnostics(peak: peak, peakDb: peakDb, frameCount: frameCount)
+    }
+
+    private func recordSignalDiagnostics(peak: Float32, peakDb: Float32, frameCount: UInt32) {
+        updateMaximumAbsoluteSample(peak)
+
+        if peak == 0 {
+            exactlySilentRenderCount.wrappingIncrement(ordering: .relaxed)
+        }
+        if peakDb < -90 {
+            below90DbRenderCount.wrappingIncrement(ordering: .relaxed)
+        }
+
+        let now = DispatchTime.now().uptimeNanoseconds
+        let renderedFrames = successfulRenderFrameCount.load(ordering: .relaxed)
+        let frameOffset = renderedFrames >= UInt64(frameCount) ? renderedFrames - UInt64(frameCount) : 0
+
+        if peak > 0 {
+            _ = firstNonZeroSignalAtNanoseconds.compareExchange(
+                expected: 0, desired: now, ordering: .relaxed
+            )
+            _ = firstNonZeroSignalFrameOffset.compareExchange(
+                expected: 0, desired: frameOffset + 1, ordering: .relaxed
+            )
+        }
+        if peakDb >= -90 {
+            _ = firstSignalAbove90DbAtNanoseconds.compareExchange(
+                expected: 0, desired: now, ordering: .relaxed
+            )
+            _ = firstSignalAbove90DbFrameOffset.compareExchange(
+                expected: 0, desired: frameOffset + 1, ordering: .relaxed
+            )
+        }
+        if peakDb >= -60 {
+            _ = firstSignalAbove60DbAtNanoseconds.compareExchange(
+                expected: 0, desired: now, ordering: .relaxed
+            )
+            _ = firstSignalAbove60DbFrameOffset.compareExchange(
+                expected: 0, desired: frameOffset + 1, ordering: .relaxed
+            )
+        }
+        if peakDb >= -40 {
+            _ = firstSignalAbove40DbAtNanoseconds.compareExchange(
+                expected: 0, desired: now, ordering: .relaxed
+            )
+            _ = firstSignalAbove40DbFrameOffset.compareExchange(
+                expected: 0, desired: frameOffset + 1, ordering: .relaxed
+            )
+        }
+    }
+
+    private func updateMaximumAbsoluteSample(_ peak: Float32) {
+        var currentBits = maximumAbsoluteSampleBits.load(ordering: .relaxed)
+        while peak > Float32(bitPattern: currentBits) {
+            let exchange = maximumAbsoluteSampleBits.compareExchange(
+                expected: currentBits,
+                desired: peak.bitPattern,
+                ordering: .relaxed
+            )
+            if exchange.exchanged { return }
+            currentBits = exchange.original
+        }
     }
 
     private func enqueueInputBuffer(
@@ -923,6 +1161,7 @@ final class CoreAudioRecorder: @unchecked Sendable {
         guard !inputBufferSlots.isEmpty,
             let inputData = inputBuffer.mBuffers.mData
         else {
+            unavailableEnqueueBufferCount.wrappingIncrement(ordering: .relaxed)
             return
         }
 
@@ -930,6 +1169,7 @@ final class CoreAudioRecorder: @unchecked Sendable {
         let sampleCount = frameCount * channelCount
 
         guard sampleCount <= inputBufferCapacitySamples else {
+            oversizedEnqueueRequestCount.wrappingIncrement(ordering: .relaxed)
             droppedInputBuffersCapacity.wrappingIncrement(ordering: .relaxed)
             return
         }
@@ -950,6 +1190,7 @@ final class CoreAudioRecorder: @unchecked Sendable {
         slot.samples.update(from: inputSamples, count: Int(sampleCount))
 
         inputWriteIndex.store(writeIndex + 1, ordering: .releasing)
+        enqueuedFrameCount.wrappingIncrement(by: UInt64(frameCount), ordering: .relaxed)
         scheduleAudioProcessing()
     }
 
@@ -1015,8 +1256,8 @@ final class CoreAudioRecorder: @unchecked Sendable {
     }
 
     private func logDroppedInputBufferCounters(context: String) {
-        let backpressureDrops = droppedInputBuffersBackpressure.exchange(0, ordering: .acquiringAndReleasing)
-        let capacityDrops = droppedInputBuffersCapacity.exchange(0, ordering: .acquiringAndReleasing)
+        let backpressureDrops = droppedInputBuffersBackpressure.load(ordering: .acquiring)
+        let capacityDrops = droppedInputBuffersCapacity.load(ordering: .acquiring)
 
         if backpressureDrops > 0 || capacityDrops > 0 {
             logger.warning(
@@ -1037,7 +1278,10 @@ final class CoreAudioRecorder: @unchecked Sendable {
         inputChannels: UInt32,
         inputSampleRate: Double
     ) {
-        guard let file = audioFile else { return }
+        guard let file = audioFile else {
+            missingAudioFileBufferCount.wrappingIncrement(ordering: .relaxed)
+            return
+        }
 
         let outputSampleRate = outputFormat.mSampleRate
 
@@ -1048,7 +1292,10 @@ final class CoreAudioRecorder: @unchecked Sendable {
         guard outputFrameCount > 0,
             let outputBuffer = conversionBuffer,
             outputFrameCount <= conversionBufferSize
-        else { return }
+        else {
+            rejectedConversionBufferCount.wrappingIncrement(ordering: .relaxed)
+            return
+        }
 
         // Convert Float32 multi-channel → Int16 mono (with sample rate conversion if needed)
         if inputSampleRate == outputSampleRate {
@@ -1104,11 +1351,30 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
         let writeStatus = ExtAudioFileWrite(file, outputFrameCount, &outputBufferList)
         if writeStatus != noErr {
+            fileWriteFailureCount.wrappingIncrement(ordering: .relaxed)
+            _ = firstFileWriteFailureStatus.compareExchange(
+                expected: 0,
+                desired: writeStatus,
+                ordering: .relaxed
+            )
             logger.error("🎙️ ExtAudioFileWrite failed with status: \(writeStatus, privacy: .public)")
+        } else {
+            writtenFrameCount.wrappingIncrement(by: UInt64(outputFrameCount), ordering: .relaxed)
+            _ = firstFileWriteAtNanoseconds.compareExchange(
+                expected: 0,
+                desired: DispatchTime.now().uptimeNanoseconds,
+                ordering: .relaxed
+            )
         }
 
         // Send the same PCM data to the streaming callback if set.
         if let audioChunk = onAudioChunk {
+            audioChunkCount.wrappingIncrement(ordering: .relaxed)
+            _ = firstAudioChunkAtNanoseconds.compareExchange(
+                expected: 0,
+                desired: DispatchTime.now().uptimeNanoseconds,
+                ordering: .relaxed
+            )
             let byteCount = Int(outputFrameCount) * MemoryLayout<Int16>.size
             let data = Data(bytes: outputBuffer, count: byteCount)
             audioChunk(data)
@@ -1117,6 +1383,450 @@ final class CoreAudioRecorder: @unchecked Sendable {
 
     private func renderFrameCapacity(for deviceID: AudioDeviceID) -> UInt32 {
         max(maxFramesPerRender, getBufferFrameSize(deviceID: deviceID) ?? maxFramesPerRender)
+    }
+
+    // MARK: - Capture Diagnostics
+
+    private func beginCaptureDiagnostics() {
+        recordingAttemptID = RecordingDiagnostics.shared.currentID ?? UUID().uuidString
+        captureStartedAtNanoseconds.store(DispatchTime.now().uptimeNanoseconds, ordering: .relaxed)
+        audioUnitStartCalledAtNanoseconds.store(0, ordering: .relaxed)
+        audioUnitStartReturnedAtNanoseconds.store(0, ordering: .relaxed)
+        audioUnitStartStatus.store(0, ordering: .relaxed)
+        firstInputCallbackAtNanoseconds.store(0, ordering: .relaxed)
+        firstSuccessfulRenderAtNanoseconds.store(0, ordering: .relaxed)
+        firstNonZeroSignalAtNanoseconds.store(0, ordering: .relaxed)
+        firstSignalAbove90DbAtNanoseconds.store(0, ordering: .relaxed)
+        firstSignalAbove60DbAtNanoseconds.store(0, ordering: .relaxed)
+        firstSignalAbove40DbAtNanoseconds.store(0, ordering: .relaxed)
+        firstNonZeroSignalFrameOffset.store(0, ordering: .relaxed)
+        firstSignalAbove90DbFrameOffset.store(0, ordering: .relaxed)
+        firstSignalAbove60DbFrameOffset.store(0, ordering: .relaxed)
+        firstSignalAbove40DbFrameOffset.store(0, ordering: .relaxed)
+        maximumAbsoluteSampleBits.store(Float32(0).bitPattern, ordering: .relaxed)
+        exactlySilentRenderCount.store(0, ordering: .relaxed)
+        below90DbRenderCount.store(0, ordering: .relaxed)
+        firstFileWriteAtNanoseconds.store(0, ordering: .relaxed)
+        firstAudioChunkAtNanoseconds.store(0, ordering: .relaxed)
+        audioChunkCount.store(0, ordering: .relaxed)
+        inputCallbackCount.store(0, ordering: .relaxed)
+        inputCallbackFrameCount.store(0, ordering: .relaxed)
+        successfulRenderCount.store(0, ordering: .relaxed)
+        successfulRenderFrameCount.store(0, ordering: .relaxed)
+        renderFailureCount.store(0, ordering: .relaxed)
+        firstRenderFailureStatus.store(0, ordering: .relaxed)
+        missingRenderBufferCount.store(0, ordering: .relaxed)
+        oversizedRenderRequestCount.store(0, ordering: .relaxed)
+        unavailableEnqueueBufferCount.store(0, ordering: .relaxed)
+        oversizedEnqueueRequestCount.store(0, ordering: .relaxed)
+        enqueuedFrameCount.store(0, ordering: .relaxed)
+        missingAudioFileBufferCount.store(0, ordering: .relaxed)
+        rejectedConversionBufferCount.store(0, ordering: .relaxed)
+        writtenFrameCount.store(0, ordering: .relaxed)
+        fileWriteFailureCount.store(0, ordering: .relaxed)
+        firstFileWriteFailureStatus.store(0, ordering: .relaxed)
+        droppedInputBuffersBackpressure.store(0, ordering: .relaxed)
+        droppedInputBuffersCapacity.store(0, ordering: .relaxed)
+        deviceAliveChangeCount.store(0, ordering: .relaxed)
+        deviceSampleRateChangeCount.store(0, ordering: .relaxed)
+        deviceStreamConfigurationChangeCount.store(0, ordering: .relaxed)
+        deviceBufferSizeChangeCount.store(0, ordering: .relaxed)
+        deviceRunningChangeCount.store(0, ordering: .relaxed)
+        RecordingDiagnostics.shared.mark(
+            "core-audio-capture-diagnostics-began",
+            details: "id=\(recordingAttemptID ?? "none")"
+        )
+    }
+
+    private func logCaptureStart(reusedPreparedAudioUnit: Bool) {
+        guard let recordingAttemptID else { return }
+
+        let liveFormat = getCurrentAudioUnitInputFormat()
+        let liveSampleRate = liveFormat?.mSampleRate ?? -1
+        let liveChannels = liveFormat?.mChannelsPerFrame ?? 0
+        let nominalSampleRate = getNominalSampleRate(deviceID: currentDeviceID) ?? -1
+        let hardwareBufferFrames = getBufferFrameSize(deviceID: currentDeviceID) ?? 0
+        let maximumFramesPerSlice = getAudioUnitMaximumFramesPerSlice() ?? 0
+        let allocatedRenderFrames = captureChannelCount > 0 ? renderBufferSize / captureChannelCount : 0
+        let audioUnitRunning = getAudioUnitIsRunning() ?? 0
+        let boundDeviceID = getAudioUnitCurrentDevice() ?? 0
+        let deviceAlive = isDeviceAvailable(currentDeviceID)
+        let preferredChannels = diagnosticPreferredInputChannels.map { String(describing: $0) } ?? "unavailable"
+        let mappedChannels = diagnosticMappedInputChannels.map { $0 + 1 }
+        let deviceUID = getDeviceStringProperty(
+            deviceID: currentDeviceID,
+            selector: kAudioDevicePropertyDeviceUID
+        ) ?? "unknown"
+        let modelUID = getDeviceStringProperty(
+            deviceID: currentDeviceID,
+            selector: kAudioDevicePropertyModelUID
+        ) ?? "unknown"
+        let inputLatencyFrames = getUInt32DeviceProperty(
+            deviceID: currentDeviceID,
+            selector: kAudioDevicePropertyLatency,
+            scope: kAudioDevicePropertyScopeInput
+        ) ?? 0
+        let safetyOffsetFrames = getUInt32DeviceProperty(
+            deviceID: currentDeviceID,
+            selector: kAudioDevicePropertySafetyOffset,
+            scope: kAudioDevicePropertyScopeInput
+        ) ?? 0
+        let clockDomain = getUInt32DeviceProperty(
+            deviceID: currentDeviceID,
+            selector: kAudioDevicePropertyClockDomain,
+            scope: kAudioObjectPropertyScopeGlobal
+        ) ?? 0
+        let actualSampleRate = getDoubleDeviceProperty(
+            deviceID: currentDeviceID,
+            selector: kAudioDevicePropertyActualSampleRate,
+            scope: kAudioObjectPropertyScopeGlobal
+        ) ?? -1
+        let systemDefaultInputDeviceID = getSystemDefaultInputDeviceID() ?? 0
+        let startCalledAt = audioUnitStartCalledAtNanoseconds.load(ordering: .relaxed)
+        let startReturnedAt = audioUnitStartReturnedAtNanoseconds.load(ordering: .relaxed)
+
+        logger.notice(
+            "🎙️ Capture diagnostic start id=\(recordingAttemptID, privacy: .public) requestedDeviceID=\(self.currentDeviceID, privacy: .public) boundDeviceID=\(boundDeviceID, privacy: .public) reusedPreparedUnit=\(reusedPreparedAudioUnit, privacy: .public) audioUnitRunning=\(audioUnitRunning, privacy: .public) deviceAlive=\(deviceAlive, privacy: .public)"
+        )
+        logger.notice(
+            "🎙️ Capture diagnostic format id=\(recordingAttemptID, privacy: .public) nativeRate=\(self.deviceFormat.mSampleRate, privacy: .public) nativeChannels=\(self.deviceFormat.mChannelsPerFrame, privacy: .public) nativeFormatID=\(self.deviceFormat.mFormatID, privacy: .public) nativeFormatFlags=\(self.deviceFormat.mFormatFlags, privacy: .public) captureChannels=\(self.captureChannelCount, privacy: .public) preferredChannels=\(preferredChannels, privacy: .public) mappedChannels=\(mappedChannels, privacy: .public) liveRate=\(liveSampleRate, privacy: .public) liveChannels=\(liveChannels, privacy: .public) nominalRate=\(nominalSampleRate, privacy: .public) actualRate=\(actualSampleRate, privacy: .public) hardwareBufferFrames=\(hardwareBufferFrames, privacy: .public) maximumFramesPerSlice=\(maximumFramesPerSlice, privacy: .public) allocatedRenderFrames=\(allocatedRenderFrames, privacy: .public)"
+        )
+        logger.notice(
+            "🎙️ Capture diagnostic hardware id=\(recordingAttemptID, privacy: .public) uid=\(deviceUID, privacy: .public) modelUID=\(modelUID, privacy: .public) transport=\(self.getTransportType(deviceID: self.currentDeviceID), privacy: .public) systemDefaultInputDeviceID=\(systemDefaultInputDeviceID, privacy: .public) inputLatencyFrames=\(inputLatencyFrames, privacy: .public) safetyOffsetFrames=\(safetyOffsetFrames, privacy: .public) clockDomain=\(clockDomain, privacy: .public)"
+        )
+        logger.notice(
+            "🎙️ Capture diagnostic startup-call id=\(recordingAttemptID, privacy: .public) startCallFromCaptureMs=\(self.diagnosticLatencyMilliseconds(startedAt: self.captureStartedAtNanoseconds.load(ordering: .relaxed), eventAt: startCalledAt), privacy: .public) startCallDurationMs=\(self.diagnosticLatencyMilliseconds(startedAt: startCalledAt, eventAt: startReturnedAt), privacy: .public) startStatus=\(self.audioUnitStartStatus.load(ordering: .relaxed), privacy: .public)"
+        )
+        RecordingDiagnostics.shared.mark(
+            "core-audio-unit-start-returned",
+            details: "status=\(audioUnitStartStatus.load(ordering: .relaxed)) reusedPreparedUnit=\(reusedPreparedAudioUnit)"
+        )
+    }
+
+    private func logCaptureSummary(context: String, fileURL: URL?) {
+        guard let recordingAttemptID else { return }
+
+        let startedAt = captureStartedAtNanoseconds.load(ordering: .relaxed)
+        let firstCallbackAt = firstInputCallbackAtNanoseconds.load(ordering: .relaxed)
+        let firstRenderAt = firstSuccessfulRenderAtNanoseconds.load(ordering: .relaxed)
+        let startCalledAt = audioUnitStartCalledAtNanoseconds.load(ordering: .relaxed)
+        let startReturnedAt = audioUnitStartReturnedAtNanoseconds.load(ordering: .relaxed)
+        let callbackLatencyMs = diagnosticLatencyMilliseconds(startedAt: startedAt, eventAt: firstCallbackAt)
+        let successfulRenderLatencyMs = diagnosticLatencyMilliseconds(startedAt: startedAt, eventAt: firstRenderAt)
+        let callbacks = inputCallbackCount.load(ordering: .relaxed)
+        let callbackFrames = inputCallbackFrameCount.load(ordering: .relaxed)
+        let successfulRenders = successfulRenderCount.load(ordering: .relaxed)
+        let successfulRenderFrames = successfulRenderFrameCount.load(ordering: .relaxed)
+        let renderFailures = renderFailureCount.load(ordering: .relaxed)
+        let firstRenderStatus = firstRenderFailureStatus.load(ordering: .relaxed)
+        let missingRenderBuffers = missingRenderBufferCount.load(ordering: .relaxed)
+        let oversizedRenderRequests = oversizedRenderRequestCount.load(ordering: .relaxed)
+        let unavailableEnqueueBuffers = unavailableEnqueueBufferCount.load(ordering: .relaxed)
+        let oversizedEnqueueRequests = oversizedEnqueueRequestCount.load(ordering: .relaxed)
+        let capacityDrops = droppedInputBuffersCapacity.load(ordering: .relaxed)
+        let backpressureDrops = droppedInputBuffersBackpressure.load(ordering: .relaxed)
+        let enqueuedFrames = enqueuedFrameCount.load(ordering: .relaxed)
+        let missingAudioFileBuffers = missingAudioFileBufferCount.load(ordering: .relaxed)
+        let rejectedConversionBuffers = rejectedConversionBufferCount.load(ordering: .relaxed)
+        let writtenFrames = writtenFrameCount.load(ordering: .relaxed)
+        let writeFailures = fileWriteFailureCount.load(ordering: .relaxed)
+        let firstWriteStatus = firstFileWriteFailureStatus.load(ordering: .relaxed)
+        let outputDuration = Double(writtenFrames) / outputFormat.mSampleRate
+        let fileBytes = diagnosticFileSize(fileURL)
+        let firstNonZeroAt = firstNonZeroSignalAtNanoseconds.load(ordering: .relaxed)
+        let firstAbove90At = firstSignalAbove90DbAtNanoseconds.load(ordering: .relaxed)
+        let firstAbove60At = firstSignalAbove60DbAtNanoseconds.load(ordering: .relaxed)
+        let firstAbove40At = firstSignalAbove40DbAtNanoseconds.load(ordering: .relaxed)
+        let maximumAbsoluteSample = Float32(
+            bitPattern: maximumAbsoluteSampleBits.load(ordering: .relaxed)
+        )
+        let maximumPeakDb = 20.0 * log10(max(maximumAbsoluteSample, 0.000001))
+        let firstWriteAt = firstFileWriteAtNanoseconds.load(ordering: .relaxed)
+        let firstChunkAt = firstAudioChunkAtNanoseconds.load(ordering: .relaxed)
+
+        logger.notice(
+            "🎙️ Capture diagnostic lifecycle id=\(recordingAttemptID, privacy: .public) context=\(context, privacy: .public) callbacks=\(callbacks, privacy: .public) callbackFrames=\(callbackFrames, privacy: .public) firstCallbackMs=\(callbackLatencyMs, privacy: .public) firstSuccessfulRenderMs=\(successfulRenderLatencyMs, privacy: .public)"
+        )
+        logger.notice(
+            "🎙️ Capture diagnostic render id=\(recordingAttemptID, privacy: .public) successfulRenders=\(successfulRenders, privacy: .public) successfulRenderFrames=\(successfulRenderFrames, privacy: .public) renderFailures=\(renderFailures, privacy: .public) firstRenderStatus=\(firstRenderStatus, privacy: .public) missingRenderBuffers=\(missingRenderBuffers, privacy: .public) oversizedRenderRequests=\(oversizedRenderRequests, privacy: .public)"
+        )
+        logger.notice(
+            "🎙️ Capture diagnostic queue id=\(recordingAttemptID, privacy: .public) capacityDrops=\(capacityDrops, privacy: .public) unavailableEnqueueBuffers=\(unavailableEnqueueBuffers, privacy: .public) oversizedEnqueueRequests=\(oversizedEnqueueRequests, privacy: .public) backpressureDrops=\(backpressureDrops, privacy: .public) enqueuedFrames=\(enqueuedFrames, privacy: .public) missingAudioFileBuffers=\(missingAudioFileBuffers, privacy: .public) rejectedConversionBuffers=\(rejectedConversionBuffers, privacy: .public)"
+        )
+        logger.notice(
+            "🎙️ Capture diagnostic output id=\(recordingAttemptID, privacy: .public) writtenFrames=\(writtenFrames, privacy: .public) durationSeconds=\(outputDuration, privacy: .public) fileBytes=\(fileBytes, privacy: .public) writeFailures=\(writeFailures, privacy: .public) firstWriteStatus=\(firstWriteStatus, privacy: .public)"
+        )
+        logger.notice(
+            "🎙️ Capture diagnostic startup-timing id=\(recordingAttemptID, privacy: .public) startCallFromCaptureMs=\(self.diagnosticLatencyMilliseconds(startedAt: startedAt, eventAt: startCalledAt), privacy: .public) startCallDurationMs=\(self.diagnosticLatencyMilliseconds(startedAt: startCalledAt, eventAt: startReturnedAt), privacy: .public) firstCallbackFromStartCallMs=\(self.diagnosticSignedDeltaMilliseconds(from: startCalledAt, to: firstCallbackAt), privacy: .public) firstCallbackFromStartReturnMs=\(self.diagnosticSignedDeltaMilliseconds(from: startReturnedAt, to: firstCallbackAt), privacy: .public) firstWriteFromCaptureMs=\(self.diagnosticLatencyMilliseconds(startedAt: startedAt, eventAt: firstWriteAt), privacy: .public) firstChunkFromCaptureMs=\(self.diagnosticLatencyMilliseconds(startedAt: startedAt, eventAt: firstChunkAt), privacy: .public) audioChunks=\(self.audioChunkCount.load(ordering: .relaxed), privacy: .public)"
+        )
+        logger.notice(
+            "🎙️ Capture diagnostic signal id=\(recordingAttemptID, privacy: .public) firstNonZeroFromCaptureMs=\(self.diagnosticLatencyMilliseconds(startedAt: startedAt, eventAt: firstNonZeroAt), privacy: .public) firstAboveMinus90FromCaptureMs=\(self.diagnosticLatencyMilliseconds(startedAt: startedAt, eventAt: firstAbove90At), privacy: .public) firstAboveMinus60FromCaptureMs=\(self.diagnosticLatencyMilliseconds(startedAt: startedAt, eventAt: firstAbove60At), privacy: .public) firstAboveMinus40FromCaptureMs=\(self.diagnosticLatencyMilliseconds(startedAt: startedAt, eventAt: firstAbove40At), privacy: .public) leadingNonZeroAudioMs=\(self.diagnosticFrameOffsetMilliseconds(self.firstNonZeroSignalFrameOffset.load(ordering: .relaxed)), privacy: .public) leadingMinus90AudioMs=\(self.diagnosticFrameOffsetMilliseconds(self.firstSignalAbove90DbFrameOffset.load(ordering: .relaxed)), privacy: .public) leadingMinus60AudioMs=\(self.diagnosticFrameOffsetMilliseconds(self.firstSignalAbove60DbFrameOffset.load(ordering: .relaxed)), privacy: .public) leadingMinus40AudioMs=\(self.diagnosticFrameOffsetMilliseconds(self.firstSignalAbove40DbFrameOffset.load(ordering: .relaxed)), privacy: .public) maximumPeakDb=\(maximumPeakDb, privacy: .public) exactlySilentRenders=\(self.exactlySilentRenderCount.load(ordering: .relaxed), privacy: .public) belowMinus90Renders=\(self.below90DbRenderCount.load(ordering: .relaxed), privacy: .public)"
+        )
+        logger.notice(
+            "🎙️ Capture diagnostic device-events id=\(recordingAttemptID, privacy: .public) alive=\(self.deviceAliveChangeCount.load(ordering: .relaxed), privacy: .public) sampleRate=\(self.deviceSampleRateChangeCount.load(ordering: .relaxed), privacy: .public) streamConfiguration=\(self.deviceStreamConfigurationChangeCount.load(ordering: .relaxed), privacy: .public) bufferSize=\(self.deviceBufferSizeChangeCount.load(ordering: .relaxed), privacy: .public) running=\(self.deviceRunningChangeCount.load(ordering: .relaxed), privacy: .public)"
+        )
+        let finalFormat = getCurrentAudioUnitInputFormat()
+        logger.notice(
+            "🎙️ Capture diagnostic final-device id=\(recordingAttemptID, privacy: .public) requestedDeviceID=\(self.currentDeviceID, privacy: .public) boundDeviceID=\(self.getAudioUnitCurrentDevice() ?? 0, privacy: .public) deviceAlive=\(self.isDeviceAvailable(self.currentDeviceID), privacy: .public) configuredRate=\(self.deviceFormat.mSampleRate, privacy: .public) liveRate=\(finalFormat?.mSampleRate ?? -1, privacy: .public) liveChannels=\(finalFormat?.mChannelsPerFrame ?? 0, privacy: .public) nominalRate=\(self.getNominalSampleRate(deviceID: self.currentDeviceID) ?? -1, privacy: .public) hardwareBufferFrames=\(self.getBufferFrameSize(deviceID: self.currentDeviceID) ?? 0, privacy: .public) maximumFramesPerSlice=\(self.getAudioUnitMaximumFramesPerSlice() ?? 0, privacy: .public)"
+        )
+
+        if callbacks == 0 {
+            logger.error(
+                "❌ Capture diagnostic failure id=\(recordingAttemptID, privacy: .public) reason=no-input-callbacks"
+            )
+        } else if successfulRenders == 0 {
+            logger.error(
+                "❌ Capture diagnostic failure id=\(recordingAttemptID, privacy: .public) reason=no-successful-renders firstRenderStatus=\(firstRenderStatus, privacy: .public) capacityDrops=\(capacityDrops, privacy: .public)"
+            )
+        } else if writtenFrames == 0 {
+            logger.error(
+                "❌ Capture diagnostic failure id=\(recordingAttemptID, privacy: .public) reason=no-written-frames enqueuedFrames=\(enqueuedFrames, privacy: .public) writeFailures=\(writeFailures, privacy: .public)"
+            )
+        } else if firstAbove90At == 0 {
+            logger.error(
+                "❌ Capture diagnostic failure id=\(recordingAttemptID, privacy: .public) reason=no-signal-above-minus-90-dB maximumPeakDb=\(maximumPeakDb, privacy: .public)"
+            )
+        }
+
+        RecordingDiagnostics.shared.mark(
+            "core-audio-capture-summary-emitted",
+            details: "context=\(context) callbacks=\(callbacks) writtenFrames=\(writtenFrames) firstAboveMinus60Ms=\(diagnosticLatencyMilliseconds(startedAt: startedAt, eventAt: firstAbove60At))"
+        )
+        RecordingDiagnostics.shared.end(
+            expectedID: recordingAttemptID,
+            outcome: context,
+            details: "callbacks=\(callbacks) writtenFrames=\(writtenFrames)"
+        )
+        self.recordingAttemptID = nil
+    }
+
+    private func diagnosticLatencyMilliseconds(startedAt: UInt64, eventAt: UInt64) -> Double {
+        guard startedAt > 0, eventAt >= startedAt else { return -1 }
+        return Double(eventAt - startedAt) / 1_000_000.0
+    }
+
+    private func diagnosticSignedDeltaMilliseconds(from startedAt: UInt64, to eventAt: UInt64) -> Double {
+        guard startedAt > 0, eventAt > 0 else { return -1 }
+        if eventAt >= startedAt {
+            return Double(eventAt - startedAt) / 1_000_000.0
+        }
+        return -Double(startedAt - eventAt) / 1_000_000.0
+    }
+
+    private func diagnosticFrameOffsetMilliseconds(_ storedFrameOffset: UInt64) -> Double {
+        guard storedFrameOffset > 0, deviceFormat.mSampleRate > 0 else { return -1 }
+        return Double(storedFrameOffset - 1) / deviceFormat.mSampleRate * 1_000.0
+    }
+
+    private func diagnosticFileSize(_ fileURL: URL?) -> Int64 {
+        guard let fileURL,
+            let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+            let size = attributes[.size] as? NSNumber
+        else {
+            return -1
+        }
+        return size.int64Value
+    }
+
+    private func getCurrentAudioUnitInputFormat() -> AudioStreamBasicDescription? {
+        guard let audioUnit else { return nil }
+        var format = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let status = AudioUnitGetProperty(
+            audioUnit,
+            kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Input,
+            1,
+            &format,
+            &size
+        )
+        return status == noErr ? format : nil
+    }
+
+    private func getAudioUnitMaximumFramesPerSlice() -> UInt32? {
+        guard let audioUnit else { return nil }
+        var frames: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioUnitGetProperty(
+            audioUnit,
+            kAudioUnitProperty_MaximumFramesPerSlice,
+            kAudioUnitScope_Global,
+            0,
+            &frames,
+            &size
+        )
+        return status == noErr ? frames : nil
+    }
+
+    private func getAudioUnitIsRunning() -> UInt32? {
+        guard let audioUnit else { return nil }
+        var running: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioUnitGetProperty(
+            audioUnit,
+            kAudioOutputUnitProperty_IsRunning,
+            kAudioUnitScope_Global,
+            0,
+            &running,
+            &size
+        )
+        return status == noErr ? running : nil
+    }
+
+    private func getAudioUnitCurrentDevice() -> AudioDeviceID? {
+        guard let audioUnit else { return nil }
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioUnitGetProperty(
+            audioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceID,
+            &size
+        )
+        return status == noErr ? deviceID : nil
+    }
+
+    private func getNominalSampleRate(deviceID: AudioDeviceID) -> Double? {
+        getDoubleDeviceProperty(
+            deviceID: deviceID,
+            selector: kAudioDevicePropertyNominalSampleRate,
+            scope: kAudioObjectPropertyScopeGlobal
+        )
+    }
+
+    private func getUInt32DeviceProperty(
+        deviceID: AudioDeviceID,
+        selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope
+    ) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else { return nil }
+
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
+        return status == noErr ? value : nil
+    }
+
+    private func getDoubleDeviceProperty(
+        deviceID: AudioDeviceID,
+        selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope
+    ) -> Double? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(deviceID, &address) else { return nil }
+
+        var value: Double = 0
+        var size = UInt32(MemoryLayout<Double>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
+        return status == noErr ? value : nil
+    }
+
+    private func getSystemDefaultInputDeviceID() -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        return status == noErr && deviceID != 0 ? deviceID : nil
+    }
+
+    private func startObservingDeviceProperties(deviceID: AudioDeviceID) {
+        stopObservingDeviceProperties()
+        observedDeviceID = deviceID
+
+        let properties: [(selector: AudioObjectPropertySelector, scope: AudioObjectPropertyScope)] = [
+            (kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal),
+            (kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal),
+            (kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyScopeInput),
+            (kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal),
+            (kAudioDevicePropertyDeviceIsRunning, kAudioObjectPropertyScopeGlobal),
+        ]
+
+        for property in properties {
+            var address = AudioObjectPropertyAddress(
+                mSelector: property.selector,
+                mScope: property.scope,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            guard AudioObjectHasProperty(deviceID, &address) else { continue }
+
+            let status = AudioObjectAddPropertyListener(
+                deviceID,
+                &address,
+                devicePropertyListener,
+                UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+            )
+            if status == noErr {
+                observedDevicePropertyAddresses.append(address)
+            } else {
+                logger.warning(
+                    "🎙️ Failed to observe device property selector=\(property.selector, privacy: .public) deviceID=\(deviceID, privacy: .public) status=\(status, privacy: .public)"
+                )
+            }
+        }
+    }
+
+    private func stopObservingDeviceProperties() {
+        guard observedDeviceID != 0 else { return }
+        for storedAddress in observedDevicePropertyAddresses {
+            var address = storedAddress
+            let status = AudioObjectRemovePropertyListener(
+                observedDeviceID,
+                &address,
+                devicePropertyListener,
+                UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+            )
+            if status != noErr {
+                logger.warning(
+                    "🎙️ Failed to remove device property observer selector=\(address.mSelector, privacy: .public) deviceID=\(self.observedDeviceID, privacy: .public) status=\(status, privacy: .public)"
+                )
+            }
+        }
+        observedDevicePropertyAddresses.removeAll()
+        observedDeviceID = 0
+    }
+
+    private func logObservedDevicePropertyChange(selector: AudioObjectPropertySelector) {
+        let propertyName: String
+        switch selector {
+        case kAudioDevicePropertyDeviceIsAlive:
+            propertyName = "device-is-alive"
+        case kAudioDevicePropertyNominalSampleRate:
+            propertyName = "nominal-sample-rate"
+        case kAudioDevicePropertyStreamConfiguration:
+            propertyName = "stream-configuration"
+        case kAudioDevicePropertyBufferFrameSize:
+            propertyName = "buffer-frame-size"
+        case kAudioDevicePropertyDeviceIsRunning:
+            propertyName = "device-is-running"
+        default:
+            propertyName = "selector-\(selector)"
+        }
+        RecordingDiagnostics.shared.mark(
+            "audio-device-property-changed",
+            details: "deviceID=\(observedDeviceID) property=\(propertyName)"
+        )
     }
 
     // MARK: - Device Info Logging
